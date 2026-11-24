@@ -1,0 +1,74 @@
+# Автоматична копія бази Dream Team (Supabase).
+# Щонеділі вночі: повна копія схеми public + логіни (auth.users), зашифрована паролем.
+# weekly/  — останні 12 тижнів;  monthly/ — перша копія кожного місяця, назавжди.
+# Секрети (Settings → Secrets and variables → Actions):
+#   DATABASE_URL     — Supabase → Connect → «Session pooler» (порт 5432), з паролем бази
+#   BACKUP_PASSWORD  — пароль шифрування (зберігати окремо, не в GitHub!)
+name: DB backup
+
+on:
+  schedule:
+    - cron: "37 1 * * 0"   # неділя 01:37 UTC (≈ 02:37–03:37 за Варшавою)
+  workflow_dispatch: {}     # кнопка «Run workflow» — зробити копію зараз
+
+permissions:
+  contents: write
+
+concurrency: backup
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Перевірити секрети
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+        run: |
+          [ -n "$DATABASE_URL" ] || { echo "::error::Немає секрету DATABASE_URL"; exit 1; }
+          [ ${#BACKUP_PASSWORD} -ge 12 ] || { echo "::error::BACKUP_PASSWORD порожній або коротший за 12 символів"; exit 1; }
+
+      - name: Встановити pg_dump 17
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
+
+      - name: Зробити копію і зашифрувати
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          PGD=/usr/lib/postgresql/17/bin
+          DAY=$(TZ=Europe/Warsaw date +%F)
+          WORK=$(mktemp -d)
+          # 1) уся схема public (таблиці, функції, тригери, дані)
+          $PGD/pg_dump "$DATABASE_URL" --schema=public --no-owner --no-privileges -Fc -f "$WORK/public.dump"
+          # 2) логіни (для повного відновлення в новий проєкт)
+          $PGD/pg_dump "$DATABASE_URL" --data-only --table=auth.users --table=auth.identities -Fc -f "$WORK/auth.dump"
+          # перевірка: файл читається і містить таблиці
+          $PGD/pg_restore --list "$WORK/public.dump" | grep -q "TABLE DATA public daily_stats" || { echo "::error::У копії немає даних daily_stats"; exit 1; }
+          tar -C "$WORK" -czf "$WORK/backup.tgz" public.dump auth.dump
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 \
+              -o "weekly/$DAY.tgz.gpg" "$WORK/backup.tgz" 3<<<"$BACKUP_PASSWORD"
+          # перша копія місяця — в архів
+          M=${DAY:0:7}
+          ls monthly/$M.tgz.gpg >/dev/null 2>&1 || cp "weekly/$DAY.tgz.gpg" "monthly/$M.tgz.gpg"
+          # тижневі: лишаємо 12 останніх
+          ls -1 weekly/*.tgz.gpg | sort | head -n -12 | xargs -r git rm -q --
+          rm -rf "$WORK"
+          ls -la weekly monthly
+
+      - name: Зберегти в репозиторій
+        run: |
+          git config user.name "backup-bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git add -A weekly monthly
+          git commit -q -m "backup $(TZ=Europe/Warsaw date +%F)" || echo "нічого нового"
+          git push
