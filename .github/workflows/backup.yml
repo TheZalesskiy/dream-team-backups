@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Перевірити секрети
         env:
@@ -53,7 +53,10 @@ jobs:
           # 2) логіни (для повного відновлення в новий проєкт)
           $PGD/pg_dump "$DATABASE_URL" --data-only --table=auth.users --table=auth.identities -Fc -f "$WORK/auth.dump"
           # перевірка: файл читається і містить таблиці
-          $PGD/pg_restore --list "$WORK/public.dump" | grep -q "TABLE DATA public daily_stats" || { echo "::error::У копії немає даних daily_stats"; exit 1; }
+          # (без «| grep -q»: з pipefail обірваний вивід pg_restore давав хибну помилку)
+          $PGD/pg_restore --list "$WORK/public.dump" > "$WORK/list.txt"
+          grep -q "TABLE DATA public daily_stats" "$WORK/list.txt" || { echo "::error::У копії немає даних daily_stats"; exit 1; }
+          echo "Таблиць з даними: $(grep -c 'TABLE DATA' "$WORK/list.txt")"
           tar -C "$WORK" -czf "$WORK/backup.tgz" public.dump auth.dump
           gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 \
               -o "weekly/$DAY.tgz.gpg" "$WORK/backup.tgz" 3<<<"$BACKUP_PASSWORD"
